@@ -1,19 +1,20 @@
 #!/usr/bin/env python
+# Copyright 2018-2020 the Deno authors. All rights reserved. MIT license.
 # This program fails if ./tools/format.py changes any files.
 
 import sys
-import util
-import sys
 import subprocess
+import util
 
 
 def main():
     util.run([sys.executable, "tools/format.py"])
-    output = util.run_output(
-        ["git", "status", "-uno", "--porcelain", "--ignore-submodules"])
-    if len(output) > 0:
-        print "Run tools/format.py "
-        print output
+    result = util.run_output(
+        ["git", "status", "-uno", "--porcelain", "--ignore-submodules"],
+        exit_on_fail=True)
+    if result.out:
+        print("Run tools/format.py ")
+        print(result.out)
         sys.exit(1)
 
 

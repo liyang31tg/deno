@@ -1,2 +1,0 @@
-args: tests/012_async.ts --reload
-output: tests/012_async.ts.out

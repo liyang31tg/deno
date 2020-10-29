@@ -1,2 +1,0 @@
-args: tests/019_media_types.ts --reload
-output: tests/019_media_types.ts.out

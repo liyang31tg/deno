@@ -1,3 +1,0 @@
-args: tests/error_003_typescript.ts --reload
-exit_code: 1
-output: tests/error_003_typescript.ts.out

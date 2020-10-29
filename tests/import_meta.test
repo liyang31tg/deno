@@ -1,2 +1,0 @@
-args: tests/import_meta.ts --reload
-output: tests/import_meta.ts.out

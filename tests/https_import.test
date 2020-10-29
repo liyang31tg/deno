@@ -1,2 +1,0 @@
-args: tests/https_import.ts --reload
-output: tests/https_import.ts.out

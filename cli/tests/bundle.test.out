@@ -1,0 +1,23 @@
+[WILDCARD]
+function printHello() {
+    console.log("Hello");
+}
+function returnsFoo() {
+    return "Foo";
+}
+function printHello2() {
+    printHello();
+}
+export function returnsHi() {
+    return "Hi";
+}
+export function returnsFoo2() {
+    return returnsFoo();
+}
+export function printHello3() {
+    printHello2();
+}
+export function throwsError() {
+    throw Error("exception from mod1");
+}
+[WILDCARD]

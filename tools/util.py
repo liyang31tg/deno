@@ -1,19 +1,27 @@
-# Copyright 2018-2019 the Deno authors. All rights reserved. MIT license.
+# Copyright 2018-2020 the Deno authors. All rights reserved. MIT license.
+import collections
 import os
 import re
 import shutil
+import select
 import stat
 import sys
 import subprocess
 import tempfile
+import time
 
-RESET = "\x1b[0m"
-FG_RED = "\x1b[31m"
-FG_GREEN = "\x1b[32m"
+if os.environ.get("NO_COLOR", None):
+    RESET = FG_READ = FG_GREEN = ""
+else:
+    RESET = "\x1b[0m"
+    FG_RED = "\x1b[31m"
+    FG_GREEN = "\x1b[32m"
 
 executable_suffix = ".exe" if os.name == "nt" else ""
+
 root_path = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-tests_path = os.path.join(root_path, "tests")
+tests_path = os.path.join(root_path, "cli/tests")
+third_party_path = os.path.join(root_path, "third_party")
 
 
 def make_env(merge_env=None, env=None):
@@ -41,28 +49,56 @@ def add_env_path(add, env, key="PATH", prepend=False):
     env[key] = os.pathsep.join(dirs_left)
 
 
-def run(args, quiet=False, cwd=None, env=None, merge_env=None):
-    if merge_env is None:
-        merge_env = {}
+def run(args, quiet=False, cwd=None, env=None, merge_env=None, shell=None):
     args[0] = os.path.normpath(args[0])
-    if not quiet:
-        print " ".join(args)
     env = make_env(env=env, merge_env=merge_env)
-    shell = os.name == "nt"  # Run through shell to make .bat/.cmd files work.
+    if shell is None:
+        # Use the default value for 'shell' parameter.
+        #   - Posix: do not use shell.
+        #   - Windows: use shell; this makes .bat/.cmd files work.
+        shell = os.name == "nt"
+    if not quiet:
+        print(" ".join([shell_quote(arg) for arg in args]))
     rc = subprocess.call(args, cwd=cwd, env=env, shell=shell)
     if rc != 0:
         sys.exit(rc)
 
 
-def run_output(args, quiet=False, cwd=None, env=None, merge_env=None):
+CmdResult = collections.namedtuple('CmdResult', ['out', 'err', 'code'])
+
+
+def run_output(args,
+               quiet=False,
+               cwd=None,
+               env=None,
+               merge_env=None,
+               exit_on_fail=False):
     if merge_env is None:
         merge_env = {}
     args[0] = os.path.normpath(args[0])
     if not quiet:
-        print " ".join(args)
+        print(" ".join(args))
     env = make_env(env=env, merge_env=merge_env)
     shell = os.name == "nt"  # Run through shell to make .bat/.cmd files work.
-    return subprocess.check_output(args, cwd=cwd, env=env, shell=shell)
+    p = subprocess.Popen(
+        args,
+        cwd=cwd,
+        env=env,
+        shell=shell,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE)
+    try:
+        out, err = p.communicate()
+    except subprocess.CalledProcessError as e:
+        p.kill()
+        p.wait()
+        raise e
+    retcode = p.poll()
+    if retcode and exit_on_fail:
+        sys.exit(retcode)
+    # Ignore Windows CRLF (\r\n).
+    return CmdResult(
+        out.replace('\r\n', '\n'), err.replace('\r\n', '\n'), retcode)
 
 
 def shell_quote_win(arg):
@@ -83,14 +119,6 @@ def shell_quote(arg):
         # Python 2 has posix shell quoting built in, albeit in a weird place.
         from pipes import quote
         return quote(arg)
-
-
-def red_failed():
-    return "%sFAILED%s" % (FG_RED, RESET)
-
-
-def green_ok():
-    return "%sok%s" % (FG_GREEN, RESET)
 
 
 def symlink(target, name, target_is_dir=False):
@@ -138,28 +166,47 @@ def touch(fname):
         open(fname, 'a').close()
 
 
-# Recursive search for files of certain extensions.
-#   * Recursive glob doesn't exist in python 2.7.
-#   * On windows, `os.walk()` unconditionally follows symlinks.
-#     The `skip`  parameter should be used to avoid recursing through those.
-def find_exts(directories, extensions, skip=None):
-    if skip is None:
-        skip = []
-    assert isinstance(directories, list)
-    assert isinstance(extensions, list)
-    skip = [os.path.normpath(i) for i in skip]
-    matches = []
-    for directory in directories:
-        for root, dirnames, filenames in os.walk(directory):
-            if root in skip:
-                dirnames[:] = []  # Don't recurse further into this directory.
-                continue
-            for filename in filenames:
-                for ext in extensions:
-                    if filename.endswith(ext):
-                        matches.append(os.path.join(root, filename))
-                        break
-    return matches
+# Recursively list all files in (a subdirectory of) a git worktree.
+#   * Optionally, glob patterns may be specified to e.g. only list files with a
+#     certain extension.
+#   * Untracked files are included, unless they're listed in .gitignore.
+#   * Directory names themselves are not listed (but the files inside are).
+#   * Submodules and their contents are ignored entirely.
+#   * This function fails if the query matches no files.
+def git_ls_files(base_dir, patterns=None):
+    base_dir = os.path.abspath(base_dir)
+    args = [
+        "git", "-C", base_dir, "ls-files", "-z", "--exclude-standard",
+        "--cached", "--modified", "--others"
+    ]
+    if patterns:
+        args += ["--"] + patterns
+    output = subprocess.check_output(args)
+    files = [
+        os.path.normpath(os.path.join(base_dir, f)) for f in output.split("\0")
+        if f != ""
+    ]
+    if not files:
+        raise RuntimeError("git_ls_files: no files in '%s'" % base_dir +
+                           (" matching %s" % patterns if patterns else ""))
+    return files
+
+
+# list all files staged for commit
+def git_staged(base_dir, patterns=None):
+    base_dir = os.path.abspath(base_dir)
+    args = [
+        "git", "-C", base_dir, "diff", "--staged", "--diff-filter=ACMR",
+        "--name-only", "-z"
+    ]
+    if patterns:
+        args += ["--"] + patterns
+    output = subprocess.check_output(args)
+    files = [
+        os.path.normpath(os.path.join(base_dir, f)) for f in output.split("\0")
+        if f != ""
+    ]
+    return files
 
 
 # The Python equivalent of `rm -rf`.
@@ -173,49 +220,16 @@ def rmtree(directory):
     shutil.rmtree(directory, onerror=rm_readonly)
 
 
-def build_mode(default="debug"):
-    if "DENO_BUILD_MODE" in os.environ:
-        return os.environ["DENO_BUILD_MODE"]
+def build_mode():
+    if "--release" in sys.argv:
+        return "release"
     else:
-        return default
+        return "debug"
 
 
 # E.G. "target/debug"
 def build_path():
-    if "DENO_BUILD_PATH" in os.environ:
-        return os.environ["DENO_BUILD_PATH"]
-    else:
-        return os.path.join(root_path, "target", build_mode())
-
-
-# Returns True if the expected matches the actual output, allowing variation
-# from actual where expected has the wildcard (e.g. matches /.*/)
-def pattern_match(pattern, string, wildcard="[WILDCARD]"):
-    if len(pattern) == 0:
-        return string == 0
-    if pattern == wildcard:
-        return True
-
-    parts = str.split(pattern, wildcard)
-
-    if len(parts) == 1:
-        return pattern == string
-
-    if string.startswith(parts[0]):
-        string = string[len(parts[0]):]
-    else:
-        return False
-
-    for i in range(1, len(parts)):
-        if i == (len(parts) - 1):
-            if parts[i] == "" or parts[i] == "\n":
-                return True
-        found = string.find(parts[i])
-        if found < 0:
-            return False
-        string = string[(found + len(parts[i])):]
-
-    return len(string) == 0
+    return os.path.join(root_path, "target", build_mode())
 
 
 def parse_exit_code(s):
@@ -233,9 +247,6 @@ def parse_exit_code(s):
 def enable_ansi_colors():
     if os.name != 'nt':
         return True  # On non-windows platforms this just works.
-    elif "CI" in os.environ:
-        return True  # Ansi escape codes work out of the box on Appveyor.
-
     return enable_ansi_colors_win10()
 
 
@@ -329,28 +340,6 @@ def enable_ansi_colors_win10():
     return True
 
 
-def parse_unit_test_output(output, print_to_stdout):
-    expected = None
-    actual = None
-    result = None
-    for line in iter(output.readline, ''):
-        if expected is None:
-            # expect "running 30 tests"
-            expected = extract_number(r'running (\d+) tests', line)
-        elif "test result:" in line:
-            result = line
-        if print_to_stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-    # Check that the number of expected tests equals what was reported at the
-    # bottom.
-    if result:
-        # result should be a string like this:
-        # "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ..."
-        actual = extract_number(r'(\d+) passed', result)
-    return (actual, expected)
-
-
 def extract_number(pattern, string):
     matches = re.findall(pattern, string)
     if len(matches) != 1:
@@ -358,12 +347,18 @@ def extract_number(pattern, string):
     return int(matches[0])
 
 
-def parse_wrk_output(output):
-    req_per_sec = None
-    for line in output.split("\n"):
-        if req_per_sec is None:
-            req_per_sec = extract_number(r'Requests/sec:\s+(\d+)', line)
-    return req_per_sec
+def extract_max_latency_in_milliseconds(pattern, string):
+    matches = re.findall(pattern, string)
+    if len(matches) != 1:
+        return None
+    num = float(matches[0][0])
+    unit = matches[0][1]
+    if (unit == 'ms'):
+        return num
+    elif (unit == 'us'):
+        return num / 1000
+    elif (unit == 's'):
+        return num * 1000
 
 
 def platform():
@@ -376,3 +371,45 @@ def mkdtemp():
     # 'TS5009: Cannot find the common subdirectory path for the input files.'
     temp_dir = os.environ["TEMP"] if os.name == 'nt' else None
     return tempfile.mkdtemp(dir=temp_dir)
+
+
+# This function is copied from:
+# https://gist.github.com/hayd/4f46a68fc697ba8888a7b517a414583e
+# https://stackoverflow.com/q/52954248/1240268
+def tty_capture(cmd, bytes_input, timeout=5):
+    """Capture the output of cmd with bytes_input to stdin,
+    with stdin, stdout and stderr as TTYs."""
+    # pty is not available on windows, so we import it within this function.
+    import pty
+    mo, so = pty.openpty()  # provide tty to enable line-buffering
+    me, se = pty.openpty()
+    mi, si = pty.openpty()
+    fdmap = {mo: 'stdout', me: 'stderr', mi: 'stdin'}
+
+    timeout_exact = time.time() + timeout
+    p = subprocess.Popen(
+        cmd, bufsize=1, stdin=si, stdout=so, stderr=se, close_fds=True)
+    os.write(mi, bytes_input)
+
+    select_timeout = .04  #seconds
+    res = {'stdout': b'', 'stderr': b''}
+    while True:
+        ready, _, _ = select.select([mo, me], [], [], select_timeout)
+        if ready:
+            for fd in ready:
+                data = os.read(fd, 512)
+                if not data:
+                    break
+                res[fdmap[fd]] += data
+        elif p.poll() is not None or time.time(
+        ) > timeout_exact:  # select timed-out
+            break  # p exited
+    for fd in [si, so, se, mi, mo, me]:
+        os.close(fd)  # can't do it sooner: it leads to errno.EIO error
+    p.wait()
+    return p.returncode, res['stdout'], res['stderr']
+
+
+def print_command(cmd, files):
+    noun = "file" if len(files) == 1 else "files"
+    print("%s (%d %s)" % (cmd, len(files), noun))
